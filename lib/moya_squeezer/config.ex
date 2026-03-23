@@ -1,0 +1,204 @@
+defmodule MoyaSqueezer.Config do
+  @moduledoc """
+  Parses and validates squeeze-test TOML configuration files.
+  """
+
+  @required_integer_fields ~w(connections requests_per_second payload_size duration_seconds)a
+  @optional_nonneg_integer_fields ~w(max_retries retry_backoff_ms)a
+  @optional_positive_integer_fields ~w(request_timeout_ms)a
+  @required_ratio_fields ~w(read_ratio write_ratio delete_ratio)a
+
+  @enforce_keys [
+    :connections,
+    :requests_per_second,
+    :read_ratio,
+    :write_ratio,
+    :delete_ratio,
+    :payload_size,
+    :duration_seconds,
+    :base_url,
+    :log_path,
+    :request_timeout_ms,
+    :max_retries,
+    :retry_backoff_ms
+  ]
+  defstruct [
+    :connections,
+    :requests_per_second,
+    :read_ratio,
+    :write_ratio,
+    :delete_ratio,
+    :payload_size,
+    :duration_seconds,
+    :base_url,
+    :log_path,
+    :request_timeout_ms,
+    :max_retries,
+    :retry_backoff_ms,
+    read_path: "/read",
+    write_path: "/write",
+    delete_path: "/delete"
+  ]
+
+  @type t :: %__MODULE__{
+          connections: pos_integer(),
+          requests_per_second: pos_integer(),
+          read_ratio: float(),
+          write_ratio: float(),
+          delete_ratio: float(),
+          payload_size: pos_integer(),
+          duration_seconds: pos_integer(),
+          base_url: String.t(),
+          log_path: String.t(),
+          request_timeout_ms: pos_integer(),
+          max_retries: non_neg_integer(),
+          retry_backoff_ms: non_neg_integer(),
+          read_path: String.t(),
+          write_path: String.t(),
+          delete_path: String.t()
+        }
+
+  @spec from_toml_file(String.t()) :: {:ok, t()} | {:error, String.t()}
+  def from_toml_file(path) do
+    with {:ok, content} <- File.read(path),
+         {:ok, decoded} <- Toml.decode(content),
+         {:ok, config} <- from_map(decoded) do
+      {:ok, config}
+    else
+      {:error, reason} when is_binary(reason) ->
+        {:error, reason}
+
+      {:error, reason} ->
+        {:error, "failed to parse config: #{inspect(reason)}"}
+    end
+  end
+
+  @spec from_map(map()) :: {:ok, t()} | {:error, String.t()}
+  def from_map(map) when is_map(map) do
+    with :ok <- validate_required_integer_fields(map),
+         :ok <- validate_required_ratio_fields(map),
+         :ok <- validate_optional_nonneg_integer_fields(map),
+         :ok <- validate_optional_positive_integer_fields(map),
+         :ok <- validate_ratios_sum(map) do
+      {:ok,
+       %__MODULE__{
+         connections: fetch_required(map, :connections),
+         requests_per_second: fetch_required(map, :requests_per_second),
+         read_ratio: ratio(fetch_required(map, :read_ratio)),
+         write_ratio: ratio(fetch_required(map, :write_ratio)),
+         delete_ratio: ratio(fetch_required(map, :delete_ratio)),
+         payload_size: fetch_required(map, :payload_size),
+         duration_seconds: fetch_required(map, :duration_seconds),
+         base_url: fetch_optional(map, :base_url, "http://localhost:9000"),
+         log_path: fetch_optional(map, :log_path, "squeeze_metrics.log"),
+         request_timeout_ms: fetch_optional(map, :request_timeout_ms, 5_000),
+         max_retries: fetch_optional(map, :max_retries, 0),
+         retry_backoff_ms: fetch_optional(map, :retry_backoff_ms, 25),
+         read_path: fetch_optional(map, :read_path, "/read"),
+         write_path: fetch_optional(map, :write_path, "/write"),
+         delete_path: fetch_optional(map, :delete_path, "/delete")
+       }}
+    end
+  end
+
+  defp validate_required_integer_fields(map) do
+    Enum.reduce_while(@required_integer_fields, :ok, fn field, _acc ->
+      value = fetch_required(map, field)
+
+      cond do
+        not is_integer(value) ->
+          {:halt, {:error, "missing or invalid integer field: #{field}"}}
+
+        value <= 0 ->
+          {:halt, {:error, "field must be > 0: #{field}"}}
+
+        true ->
+          {:cont, :ok}
+      end
+    end)
+  end
+
+  defp validate_required_ratio_fields(map) do
+    Enum.reduce_while(@required_ratio_fields, :ok, fn field, _acc ->
+      value = fetch_required(map, field)
+
+      cond do
+        not (is_integer(value) or is_float(value)) ->
+          {:halt, {:error, "missing or invalid ratio field: #{field}"}}
+
+        value < 0 ->
+          {:halt, {:error, "ratio must be >= 0: #{field}"}}
+
+        true ->
+          {:cont, :ok}
+      end
+    end)
+  end
+
+  defp validate_ratios_sum(map) do
+    sum =
+      ratio(fetch_required(map, :read_ratio)) +
+        ratio(fetch_required(map, :write_ratio)) +
+        ratio(fetch_required(map, :delete_ratio))
+
+    if abs(sum - 1.0) <= 0.0001 do
+      :ok
+    else
+      {:error, "read/write/delete ratios must sum to 1.0"}
+    end
+  end
+
+  defp validate_optional_nonneg_integer_fields(map) do
+    Enum.reduce_while(@optional_nonneg_integer_fields, :ok, fn field, _acc ->
+      value = fetch_optional(map, field, 0)
+
+      cond do
+        not is_integer(value) ->
+          {:halt, {:error, "optional field must be an integer: #{field}"}}
+
+        value < 0 ->
+          {:halt, {:error, "optional field must be >= 0: #{field}"}}
+
+        true ->
+          {:cont, :ok}
+      end
+    end)
+  end
+
+  defp validate_optional_positive_integer_fields(map) do
+    Enum.reduce_while(@optional_positive_integer_fields, :ok, fn field, _acc ->
+      value = fetch_optional(map, field, 1)
+
+      cond do
+        not is_integer(value) ->
+          {:halt, {:error, "optional field must be an integer: #{field}"}}
+
+        value <= 0 ->
+          {:halt, {:error, "optional field must be > 0: #{field}"}}
+
+        true ->
+          {:cont, :ok}
+      end
+    end)
+  end
+
+  defp ratio(value) when is_integer(value), do: value / 1
+  defp ratio(value) when is_float(value), do: value
+
+  defp fetch_required(map, key) do
+    case Map.fetch(map, key) do
+      {:ok, value} ->
+        value
+
+      :error ->
+        Map.get(map, Atom.to_string(key))
+    end
+  end
+
+  defp fetch_optional(map, key, default) do
+    case fetch_required(map, key) do
+      nil -> default
+      value -> value
+    end
+  end
+end

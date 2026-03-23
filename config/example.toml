@@ -1,0 +1,21 @@
+connections = 25
+requests_per_second = 500
+
+read_ratio = 0.70
+write_ratio = 0.25
+delete_ratio = 0.05
+
+payload_size = 1024
+duration_seconds = 30
+
+# HTTP adapter controls
+request_timeout_ms = 5000
+max_retries = 2
+retry_backoff_ms = 25
+
+base_url = "http://localhost:9000"
+read_path = "/read"
+write_path = "/write"
+delete_path = "/delete"
+
+log_path = "logs/squeeze_metrics.csv"
