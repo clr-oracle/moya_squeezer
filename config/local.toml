@@ -1,7 +1,7 @@
-connections = 25
-requests_per_second = 500
-start_requests_per_second = 300
-rps_step = 50
+connections = 10
+requests_per_second = 5000
+start_requests_per_second = 50000
+rps_step = 5000
 step_interval_seconds = 5
 baseline_window_seconds = 10
 max_error_rate_pct = 1.0

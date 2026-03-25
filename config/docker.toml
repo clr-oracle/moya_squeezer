@@ -19,7 +19,7 @@ request_timeout_ms = 5000
 max_retries = 2
 retry_backoff_ms = 25
 
-base_url = "http://localhost:9000"
+base_url = "http://moya_db:9000"
 read_path = "/db/v0.1"
 write_path = "/db/v0.1"
 delete_path = "/db/v0.1"

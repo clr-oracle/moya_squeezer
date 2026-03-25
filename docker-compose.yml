@@ -1,0 +1,18 @@
+services:
+  moya_db:
+    build:
+      context: /Users/clr/moya_db
+    container_name: moya_db
+    ports:
+      - "9000:9000"
+
+  moya_squeezer:
+    build:
+      context: .
+    container_name: moya_squeezer
+    depends_on:
+      - moya_db
+    volumes:
+      - ./config:/app/config:ro
+      - ./logs:/app/logs
+    command: ["mix", "squeezer.run", "config/docker.toml"]

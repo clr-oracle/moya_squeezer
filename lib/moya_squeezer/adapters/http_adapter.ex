@@ -6,9 +6,9 @@ defmodule MoyaSqueezer.Adapters.HttpAdapter do
   @behaviour MoyaSqueezer.LoadAdapter
 
   @impl true
-  def request(type, payload_size, adapter_opts) do
+  def request(type, payload_size, adapter_opts, key_override \\ nil) do
     base_url = Map.fetch!(adapter_opts, :base_url)
-    request_id = System.unique_integer([:positive, :monotonic])
+    key = key_override || Integer.to_string(System.unique_integer([:positive, :monotonic]))
     payload = payload(payload_size)
     timeout_ms = Map.get(adapter_opts, :request_timeout_ms, 5_000)
     max_retries = Map.get(adapter_opts, :max_retries, 0)
@@ -17,26 +17,30 @@ defmodule MoyaSqueezer.Adapters.HttpAdapter do
     {method, url, body, headers} =
       case type do
         :read ->
-          path = Map.get(adapter_opts, :read_path, "/read")
-          {:get, "#{base_url}#{path}?id=#{request_id}", "", []}
+          path = Map.get(adapter_opts, :read_path, "/db/v0.1")
+          {:get, "#{base_url}#{path}/#{key}", "", []}
 
         :write ->
-          path = Map.get(adapter_opts, :write_path, "/write")
-          {:post, "#{base_url}#{path}", payload, [{"content-type", "text/plain"}]}
+          path = Map.get(adapter_opts, :write_path, "/db/v0.1")
+          {:post, "#{base_url}#{path}/#{key}", payload, [{"content-type", "application/json"}]}
 
         :delete ->
-          path = Map.get(adapter_opts, :delete_path, "/delete")
-          {:delete, "#{base_url}#{path}?id=#{request_id}", "", []}
+          path = Map.get(adapter_opts, :delete_path, "/db/v0.1")
+          {:delete, "#{base_url}#{path}/#{key}", "", []}
       end
 
     do_request(method, url, headers, body, timeout_ms, max_retries, retry_backoff_ms, 0)
   end
 
   defp do_request(method, url, headers, body, timeout_ms, max_retries, retry_backoff_ms, attempt) do
+    started_us = System.monotonic_time(:microsecond)
+
     result =
       method
       |> Finch.build(url, headers, body)
       |> Finch.request(MoyaSqueezerFinch, receive_timeout: timeout_ms)
+
+    db_latency_us = System.monotonic_time(:microsecond) - started_us
 
     case result do
       {:ok, %Finch.Response{status: status}} when status >= 500 and attempt < max_retries ->
@@ -54,7 +58,7 @@ defmodule MoyaSqueezer.Adapters.HttpAdapter do
         )
 
       {:ok, %Finch.Response{status: status}} ->
-        {:ok, status}
+        {:ok, status, db_latency_us}
 
       {:error, _reason} when attempt < max_retries ->
         backoff_sleep(retry_backoff_ms, attempt)
@@ -71,7 +75,7 @@ defmodule MoyaSqueezer.Adapters.HttpAdapter do
         )
 
       {:error, reason} ->
-        {:error, reason}
+        {:error, reason, db_latency_us}
     end
   end
 
@@ -80,6 +84,6 @@ defmodule MoyaSqueezer.Adapters.HttpAdapter do
   end
 
   defp payload(size) do
-    :binary.copy("x", max(size, 1))
+    "\"" <> :binary.copy("x", max(size, 1)) <> "\""
   end
 end
