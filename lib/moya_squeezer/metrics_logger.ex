@@ -11,8 +11,9 @@ defmodule MoyaSqueezer.MetricsLogger do
 
   @type metric :: %{
           request_type: :read | :write | :delete,
+          source_node: String.t(),
           started_at_ms: integer(),
-          duration_us: integer(),
+          db_latency_us: integer(),
           response_code: integer()
         }
 
@@ -33,7 +34,10 @@ defmodule MoyaSqueezer.MetricsLogger do
     {:ok, io_device} = File.open(log_path, [:append, :utf8])
 
     :ok =
-      IO.binwrite(io_device, "bucket_ms,request_type,started_at_ms,duration_us,response_code\n")
+      IO.binwrite(
+        io_device,
+        "bucket_ms,source_node,request_type,started_at_ms,db_latency_us,response_code\n"
+      )
 
     Process.send_after(self(), :flush, @flush_interval_ms)
 
@@ -73,7 +77,7 @@ defmodule MoyaSqueezer.MetricsLogger do
   defp metric_to_csv(metric) do
     bucket_ms = metric.started_at_ms |> div(@flush_interval_ms) |> Kernel.*(@flush_interval_ms)
 
-    "#{bucket_ms},#{metric.request_type},#{metric.started_at_ms}," <>
-      "#{metric.duration_us},#{metric.response_code}\n"
+    "#{bucket_ms},#{metric.source_node},#{metric.request_type},#{metric.started_at_ms}," <>
+      "#{metric.db_latency_us},#{metric.response_code}\n"
   end
 end

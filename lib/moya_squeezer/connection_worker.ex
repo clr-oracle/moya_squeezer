@@ -18,6 +18,8 @@ defmodule MoyaSqueezer.ConnectionWorker do
     :read_ratio,
     :write_ratio,
     :delete_ratio,
+    :key_pool,
+    :mode,
     token_balance: 0.0
   ]
 
@@ -31,11 +33,16 @@ defmodule MoyaSqueezer.ConnectionWorker do
           reqs_per_sec: float(),
           read_ratio: float(),
           write_ratio: float(),
-          delete_ratio: float()
+          delete_ratio: float(),
+          key_pool: pid() | atom(),
+          mode: :warmup | :measured
         ]
 
   @spec start_link(options()) :: GenServer.on_start()
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
+
+  @spec set_reqs_per_sec(pid() | atom(), float()) :: :ok
+  def set_reqs_per_sec(worker, reqs_per_sec), do: GenServer.cast(worker, {:set_reqs_per_sec, reqs_per_sec})
 
   @impl true
   def init(opts) do
@@ -49,7 +56,9 @@ defmodule MoyaSqueezer.ConnectionWorker do
       reqs_per_sec: Keyword.fetch!(opts, :reqs_per_sec),
       read_ratio: Keyword.fetch!(opts, :read_ratio),
       write_ratio: Keyword.fetch!(opts, :write_ratio),
-      delete_ratio: Keyword.fetch!(opts, :delete_ratio)
+      delete_ratio: Keyword.fetch!(opts, :delete_ratio),
+      key_pool: Keyword.fetch!(opts, :key_pool),
+      mode: Keyword.get(opts, :mode, :measured)
     }
 
     Process.send_after(self(), :tick, @tick_ms)
@@ -70,35 +79,49 @@ defmodule MoyaSqueezer.ConnectionWorker do
     {:noreply, %{state | token_balance: remaining}}
   end
 
+  @impl true
+  def handle_cast({:set_reqs_per_sec, reqs_per_sec}, state) when is_number(reqs_per_sec) do
+    {:noreply, %{state | reqs_per_sec: reqs_per_sec / 1}}
+  end
+
   defp send_one_request(state) do
     request_type = choose_request_type(state)
+    key = choose_key_for_request(request_type, state)
     started_at_ms = System.system_time(:millisecond)
-    monotonic_start = System.monotonic_time(:microsecond)
 
-    response_code =
-      case state.adapter.request(request_type, state.payload_size, state.adapter_opts) do
-        {:ok, status} -> status
-        {:error, _reason} -> 0
+    {response_code, db_latency_us} =
+      case state.adapter.request(request_type, state.payload_size, state.adapter_opts, key) do
+        {:ok, status, latency_us} -> {status, latency_us}
+        {:error, _reason, latency_us} -> {0, latency_us}
       end
 
-    duration_us = System.monotonic_time(:microsecond) - monotonic_start
+    maybe_update_key_pool(request_type, key, response_code, state)
 
     MoyaSqueezer.MetricsLogger.log(state.logger, %{
+      source_node: Atom.to_string(node()),
       request_type: request_type,
       started_at_ms: started_at_ms,
-      duration_us: duration_us,
+      db_latency_us: db_latency_us,
       response_code: response_code
     })
 
     MoyaSqueezer.StatsCollector.record(state.stats_collector, %{
       request_type: request_type,
       started_at_ms: started_at_ms,
-      duration_us: duration_us,
+      db_latency_us: db_latency_us,
       response_code: response_code
     })
   end
 
   defp choose_request_type(state) do
+    if state.mode == :warmup do
+      :write
+    else
+      choose_request_type_measured(state)
+    end
+  end
+
+  defp choose_request_type_measured(state) do
     p = :rand.uniform()
 
     cond do
@@ -112,4 +135,23 @@ defmodule MoyaSqueezer.ConnectionWorker do
         :delete
     end
   end
+
+  defp choose_key_for_request(:write, state), do: MoyaSqueezer.KeyPool.next_new_key(state.key_pool)
+
+  defp choose_key_for_request(_type, state) do
+    case MoyaSqueezer.KeyPool.random_existing_key(state.key_pool) do
+      {:ok, key} -> key
+      :empty -> MoyaSqueezer.KeyPool.next_new_key(state.key_pool)
+    end
+  end
+
+  defp maybe_update_key_pool(:write, key, status, state) when status >= 200 and status < 300 do
+    MoyaSqueezer.KeyPool.note_write_success(state.key_pool, key)
+  end
+
+  defp maybe_update_key_pool(:delete, key, status, state) when status >= 200 and status < 300 do
+    MoyaSqueezer.KeyPool.note_delete_success(state.key_pool, key)
+  end
+
+  defp maybe_update_key_pool(_type, _key, _status, _state), do: :ok
 end

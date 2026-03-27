@@ -4,8 +4,8 @@ defmodule MoyaSqueezer.Config do
   """
 
   @required_integer_fields ~w(connections requests_per_second payload_size duration_seconds)a
-  @optional_nonneg_integer_fields ~w(max_retries retry_backoff_ms)a
-  @optional_positive_integer_fields ~w(request_timeout_ms)a
+  @optional_nonneg_integer_fields ~w(max_retries retry_backoff_ms warmup_seconds rps_step)a
+  @optional_positive_integer_fields ~w(request_timeout_ms step_interval_seconds baseline_window_seconds)a
   @required_ratio_fields ~w(read_ratio write_ratio delete_ratio)a
 
   @enforce_keys [
@@ -16,11 +16,17 @@ defmodule MoyaSqueezer.Config do
     :delete_ratio,
     :payload_size,
     :duration_seconds,
+    :warmup_seconds,
     :base_url,
     :log_path,
     :request_timeout_ms,
     :max_retries,
-    :retry_backoff_ms
+    :retry_backoff_ms,
+    :start_requests_per_second,
+    :rps_step,
+    :step_interval_seconds,
+    :baseline_window_seconds,
+    :max_error_rate_pct
   ]
   defstruct [
     :connections,
@@ -30,14 +36,20 @@ defmodule MoyaSqueezer.Config do
     :delete_ratio,
     :payload_size,
     :duration_seconds,
+    :warmup_seconds,
     :base_url,
     :log_path,
     :request_timeout_ms,
     :max_retries,
     :retry_backoff_ms,
-    read_path: "/read",
-    write_path: "/write",
-    delete_path: "/delete"
+    :start_requests_per_second,
+    :rps_step,
+    :step_interval_seconds,
+    :baseline_window_seconds,
+    :max_error_rate_pct,
+    read_path: "/db/v0.1",
+    write_path: "/db/v0.1",
+    delete_path: "/db/v0.1"
   ]
 
   @type t :: %__MODULE__{
@@ -48,11 +60,17 @@ defmodule MoyaSqueezer.Config do
           delete_ratio: float(),
           payload_size: pos_integer(),
           duration_seconds: pos_integer(),
+          warmup_seconds: non_neg_integer(),
           base_url: String.t(),
           log_path: String.t(),
           request_timeout_ms: pos_integer(),
           max_retries: non_neg_integer(),
           retry_backoff_ms: non_neg_integer(),
+          start_requests_per_second: pos_integer(),
+          rps_step: non_neg_integer(),
+          step_interval_seconds: pos_integer(),
+          baseline_window_seconds: pos_integer(),
+          max_error_rate_pct: float(),
           read_path: String.t(),
           write_path: String.t(),
           delete_path: String.t()
@@ -89,14 +107,21 @@ defmodule MoyaSqueezer.Config do
          delete_ratio: ratio(fetch_required(map, :delete_ratio)),
          payload_size: fetch_required(map, :payload_size),
          duration_seconds: fetch_required(map, :duration_seconds),
+         warmup_seconds: fetch_optional(map, :warmup_seconds, 0),
          base_url: fetch_optional(map, :base_url, "http://localhost:9000"),
          log_path: fetch_optional(map, :log_path, "squeeze_metrics.log"),
          request_timeout_ms: fetch_optional(map, :request_timeout_ms, 5_000),
          max_retries: fetch_optional(map, :max_retries, 0),
          retry_backoff_ms: fetch_optional(map, :retry_backoff_ms, 25),
-         read_path: fetch_optional(map, :read_path, "/read"),
-         write_path: fetch_optional(map, :write_path, "/write"),
-         delete_path: fetch_optional(map, :delete_path, "/delete")
+         start_requests_per_second:
+           fetch_optional(map, :start_requests_per_second, fetch_required(map, :requests_per_second)),
+         rps_step: fetch_optional(map, :rps_step, 0),
+         step_interval_seconds: fetch_optional(map, :step_interval_seconds, 5),
+         baseline_window_seconds: fetch_optional(map, :baseline_window_seconds, 10),
+         max_error_rate_pct: ratio(fetch_optional(map, :max_error_rate_pct, 1.0)),
+         read_path: fetch_optional(map, :read_path, "/db/v0.1"),
+         write_path: fetch_optional(map, :write_path, "/db/v0.1"),
+         delete_path: fetch_optional(map, :delete_path, "/db/v0.1")
        }}
     end
   end
