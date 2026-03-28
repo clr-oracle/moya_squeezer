@@ -2,6 +2,15 @@
 
 Squeeze-testing framework for driving load against an existing database API.
 
+Canonical repository:
+
+- https://github.com/clr/moya_squeezer
+
+Related repositories:
+
+- Deployment/orchestration: https://github.com/clr/moya_harness
+- Database service (Moya): https://github.com/clr/moya
+
 ## What it does
 
 - Reads a TOML file that defines load dimensions.
@@ -78,61 +87,25 @@ ROLE=manager ./scripts/squeezer.sh config/local.toml --worker worker1@your-host
 ROLE=worker MANAGER_NODE=manager@your-host ./scripts/squeezer.sh
 ```
 
-## Run in containers (Docker Compose)
+## Run in containers (moved to `moya_harness`)
 
-This repo includes container artifacts for running both `moya_db` and `moya_squeezer` together.
+Multi-service deployment/orchestration for `moya_squeezer` + `moya_db` now lives in the sibling repo:
 
-The compose setup codifies a **1 Manager + 3 Workers** topology:
+- `/Users/clr/moya_harness`
 
-- `manager` runs the squeeze coordinator node (`manager@manager`)
-- `worker1`, `worker2`, `worker3` run worker nodes
-- all nodes share the same Erlang cookie (`squeeze_cookie`)
-- workers join via `--manager manager@manager`
+Use that repo for:
 
-1. Ensure `moya_db` source exists at `~/moya_db` (used as compose build context).
-2. Build images:
+- docker-compose stack runs
+- cluster startup/teardown scripts
+- deployment docs and CI/CD harnessing
 
-```bash
-docker compose build
-```
+`moya_squeezer` remains focused on squeeze app logic and config.
 
-3. Run manager + workers + db:
+Container runtime config used by manager remains in this repo at:
 
-```bash
-docker compose up --abort-on-container-exit
-```
+- `config/docker.toml`
 
-This launches one `moya_squeezer:latest` image as 4 containers (1 manager, 3 workers).
-
-4. Tear down:
-
-```bash
-docker compose down
-```
-
-### If Compose is unavailable on your machine
-
-Use the provided scripts to run the same 1-manager + 3-worker topology with plain Docker:
-
-```bash
-chmod +x scripts/run_cluster.sh scripts/stop_cluster.sh
-./scripts/run_cluster.sh
-```
-
-Stop and clean up:
-
-```bash
-./scripts/stop_cluster.sh
-```
-
-Notes:
-
-- `scripts/run_cluster.sh` builds `moya_squeezer:latest`, creates `moya_net`, starts `moya_db`, then starts `worker1..3` and `manager`.
-- Workers join manager using distributed node names and shared cookie (`squeeze_cookie`).
-- Override defaults with env vars: `IMAGE_NAME`, `DB_IMAGE`, `NETWORK_NAME`, `COOKIE`, `CONFIG_PATH`.
-- For Colima/no-Docker-Hub workflows, the Dockerfile supports a local base image via `BASE_IMAGE` (default `elixir:1.19.0`). Example: `BASE_IMAGE=elixir:1.19.0 ./scripts/run_cluster.sh`.
-
-Container config lives at `config/docker.toml` and targets:
+with DB target:
 
 `base_url = "http://moya_db:9000"`
 

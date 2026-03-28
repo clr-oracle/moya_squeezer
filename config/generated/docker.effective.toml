@@ -1,0 +1,27 @@
+connections = 25
+requests_per_second = 500
+start_requests_per_second = 500000
+rps_step = 50000
+step_interval_seconds = 5
+baseline_window_seconds = 10
+max_error_rate_pct = 1.0
+
+read_ratio = 0.70
+write_ratio = 0.25
+delete_ratio = 0.05
+
+payload_size = 1024
+duration_seconds = 30
+warmup_seconds = 10
+
+# HTTP adapter controls
+request_timeout_ms = 5000
+max_retries = 2
+retry_backoff_ms = 25
+
+base_url = "http://moya_db:9000"
+read_path = "/db/v0.1"
+write_path = "/db/v0.1"
+delete_path = "/db/v0.1"
+
+log_path = "logs/squeeze_metrics.csv"
