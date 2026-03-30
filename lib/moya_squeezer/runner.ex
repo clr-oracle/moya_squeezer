@@ -7,7 +7,6 @@ defmodule MoyaSqueezer.Runner do
 
   alias MoyaSqueezer.Config
   alias MoyaSqueezer.ConnectionWorker
-  alias MoyaSqueezer.KeyPool
   alias MoyaSqueezer.MetricsLogger
   alias MoyaSqueezer.StatsCollector
 
@@ -34,15 +33,19 @@ defmodule MoyaSqueezer.Runner do
         Keyword.fetch!(opts, :connections),
         Keyword.fetch!(opts, :adapter),
         Keyword.fetch!(opts, :adapter_opts),
-        Keyword.fetch!(opts, :logger),
         Keyword.fetch!(opts, :stats_collector),
+        Keyword.fetch!(opts, :tick_ms),
+        Keyword.fetch!(opts, :worker_inflight_limit),
+        Keyword.fetch!(opts, :stats_flush_interval_ms),
         Keyword.fetch!(opts, :payload_size),
         Keyword.fetch!(opts, :read_ratio),
         Keyword.fetch!(opts, :write_ratio),
         Keyword.fetch!(opts, :delete_ratio),
-        Keyword.fetch!(opts, :key_pool),
         Keyword.fetch!(opts, :requests_per_worker),
-        Keyword.fetch!(opts, :mode)
+        Keyword.fetch!(opts, :mode),
+        Keyword.fetch!(opts, :metrics_log_path),
+        Keyword.fetch!(opts, :metrics_flush_interval_ms),
+        Keyword.fetch!(opts, :metrics_compact)
       )
 
     with {:ok, supervisor} <-
@@ -70,6 +73,16 @@ defmodule MoyaSqueezer.Runner do
   @spec worker_segment_pids(pid()) :: [pid()]
   def worker_segment_pids(supervisor), do: worker_pids(supervisor)
 
+  @spec worker_segment_summaries(pid()) :: [map()]
+  def worker_segment_summaries(supervisor) do
+    supervisor
+    |> worker_pids()
+    |> Enum.map(&ConnectionWorker.summary/1)
+  end
+
+  @spec read_metrics_file(String.t()) :: {:ok, binary()} | {:error, term()}
+  def read_metrics_file(path), do: File.read(path)
+
   @spec set_worker_rate(pid(), float()) :: :ok
   def set_worker_rate(worker_pid, reqs_per_sec) do
     ConnectionWorker.set_reqs_per_sec(worker_pid, reqs_per_sec)
@@ -87,59 +100,63 @@ defmodule MoyaSqueezer.Runner do
   defp run_manager(config, worker_nodes) do
     adapter = Application.get_env(:moya_squeezer, :load_adapter, MoyaSqueezer.Adapters.HttpAdapter)
     start_rps = config.start_requests_per_second
-    nodes = Enum.uniq([node() | worker_nodes])
+    nodes = Enum.uniq(worker_nodes)
+
+    if nodes == [] do
+      {:error, "at least one worker node is required; manager is control-plane only"}
+    else
 
     logger_name = {:global, :"metrics_logger_#{System.unique_integer([:positive])}"}
     stats_name = {:global, :"stats_collector_#{System.unique_integer([:positive])}"}
-    key_pool_name = {:global, :"key_pool_#{System.unique_integer([:positive])}"}
-
-    per_node_connections = distribute_connections(config.connections, nodes)
+    per_node_connections = Enum.into(nodes, %{}, fn n -> {n, config.connections_per_worker} end)
+    total_connections = config.connections_per_worker * length(nodes)
 
     {:ok, stats_collector} = StatsCollector.start_link(name: stats_name, label: "manager")
-    {:ok, _key_pool} = KeyPool.start_link(name: key_pool_name)
     {:ok, supervisor} =
       Supervisor.start_link(
         [
           {MetricsLogger,
            name: logger_name,
            log_path: config.log_path,
-           flush_interval_ms: config.metrics_flush_interval_ms}
+           flush_interval_ms: config.metrics_flush_interval_ms,
+           compact: config.metrics_compact}
         ],
         strategy: :one_for_one
       )
 
-    case config.ramp_mode do
-      :concurrency ->
+      case config.ramp_mode do
+        :concurrency ->
         run_manager_concurrency_mode(
-          config,
-          nodes,
-          per_node_connections,
-          adapter,
-          logger_name,
-          stats_name,
-          key_pool_name,
-          start_rps,
-          supervisor,
-          stats_collector
-        )
+            config,
+            nodes,
+            per_node_connections,
+          total_connections,
+            adapter,
+            logger_name,
+            stats_name,
+            start_rps,
+            supervisor,
+            stats_collector
+          )
 
-      :rps ->
-        run_manager_rps_mode(
-          config,
-          nodes,
-          per_node_connections,
-          adapter,
-          logger_name,
-          stats_name,
-          key_pool_name,
-          start_rps,
-          supervisor,
-          stats_collector
-        )
+        :rps ->
+          run_manager_rps_mode(
+            config,
+            nodes,
+            per_node_connections,
+            total_connections,
+            adapter,
+            logger_name,
+            stats_name,
+            start_rps,
+            supervisor,
+            stats_collector
+          )
+      end
     end
   end
 
-  defp run_manager_rps_mode(config, nodes, per_node_connections, adapter, logger_name, stats_name, key_pool_name, start_rps, supervisor, stats_collector) do
+  defp run_manager_rps_mode(config, nodes, per_node_connections, total_connections, adapter, logger_name, stats_name, start_rps, supervisor, stats_collector) do
     warmup_segments =
       start_segments(
         nodes,
@@ -147,8 +164,7 @@ defmodule MoyaSqueezer.Runner do
         adapter,
         logger_name,
         stats_name,
-        key_pool_name,
-        start_rps / config.connections,
+        start_rps / total_connections,
         :warmup,
         config
       )
@@ -169,8 +185,7 @@ defmodule MoyaSqueezer.Runner do
           adapter,
           logger_name,
           stats_name,
-          key_pool_name,
-          initial_measured_requests_per_worker(config, start_rps),
+          initial_measured_requests_per_worker(total_connections, config, start_rps),
           :measured,
           config
         )
@@ -179,7 +194,7 @@ defmodule MoyaSqueezer.Runner do
     end
   end
 
-  defp run_manager_concurrency_mode(config, nodes, per_node_connections, adapter, logger_name, stats_name, key_pool_name, start_rps, supervisor, stats_collector) do
+  defp run_manager_concurrency_mode(config, nodes, per_node_connections, total_connections, adapter, logger_name, stats_name, start_rps, supervisor, stats_collector) do
     segments =
       start_segments(
         nodes,
@@ -187,8 +202,7 @@ defmodule MoyaSqueezer.Runner do
         adapter,
         logger_name,
         stats_name,
-        key_pool_name,
-        start_rps / config.connections,
+        start_rps / total_connections,
         :warmup,
         config
       )
@@ -224,9 +238,19 @@ defmodule MoyaSqueezer.Runner do
   defp run_measured_phase(config, stats_collector, measured_segments, start_rps, supervisor) do
     signal_setup = install_signal_handlers()
 
-    stop_reason =
+    {stop_reason, worker_summaries} =
       try do
-        run_squeeze_control_loop(config, stats_collector, measured_segments, start_rps, config.duration_seconds)
+        stop_reason =
+          run_squeeze_control_loop(
+            config,
+            stats_collector,
+            measured_segments,
+            start_rps,
+            config.duration_seconds
+          )
+
+        worker_summaries = gather_worker_summaries(measured_segments)
+        {stop_reason, worker_summaries}
       after
         safe_stop_segments(measured_segments)
         safe_supervisor_stop(supervisor)
@@ -235,6 +259,9 @@ defmodule MoyaSqueezer.Runner do
 
     report = StatsCollector.final_report(stats_collector)
     print_final_report(report, stop_reason)
+    print_worker_summary_table(worker_summaries)
+    print_halt_summary(config, stats_collector, worker_summaries)
+    merge_worker_metric_logs(config.log_path, measured_segments)
     safe_genserver_stop(stats_collector)
 
     :ok
@@ -254,8 +281,10 @@ defmodule MoyaSqueezer.Runner do
         if now_ms >= deadline_ms do
           :duration_elapsed
         else
-          baseline_p90_ms = StatsCollector.percentile_ms(stats_collector, 0.90)
-          IO.puts("[manager][baseline] p90=#{Float.round(baseline_p90_ms, 2)}ms")
+          baseline_percentile = config.stop_latency_percentile
+          baseline_latency_ms = StatsCollector.percentile_ms(stats_collector, baseline_percentile)
+          baseline_label = percentile_label(baseline_percentile)
+          IO.puts("[manager][baseline] #{baseline_label}=#{format_2dp(baseline_latency_ms)}ms")
 
           ramp_loop(%{
             config: config,
@@ -264,7 +293,8 @@ defmodule MoyaSqueezer.Runner do
             current_rps: start_rps,
             active_workers: initial_active_workers(config, worker_segments),
             total_target_rps: config.total_target_rps,
-            baseline_p90_ms: baseline_p90_ms,
+            baseline_latency_ms: baseline_latency_ms,
+            latency_breach_streak: 0,
             last_step_at_ms: now_ms,
             deadline_ms: deadline_ms
           })
@@ -290,7 +320,19 @@ defmodule MoyaSqueezer.Runner do
 
             cond do
               snapshot.error_rate_pct > state.config.max_error_rate_pct -> :error_rate_exceeded
-              snapshot.count > 0 and snapshot.p50_latency_ms > state.baseline_p90_ms -> :p50_exceeded_baseline_p90
+              snapshot.count > 0 ->
+                next_streak =
+                  if snapshot.p50_latency_ms > state.baseline_latency_ms,
+                    do: state.latency_breach_streak + 1,
+                    else: 0
+
+                if next_streak >= state.config.latency_breach_consecutive_windows do
+                  :p50_exceeded_baseline_threshold
+                else
+                  {next_state, next_step_ms} = maybe_step_load(%{state | latency_breach_streak: next_streak}, now_ms)
+                  ramp_loop(%{next_state | last_step_at_ms: next_step_ms})
+                end
+
               true ->
                 {next_state, next_step_ms} = maybe_step_load(state, now_ms)
                 ramp_loop(%{next_state | last_step_at_ms: next_step_ms})
@@ -309,7 +351,8 @@ defmodule MoyaSqueezer.Runner do
 
     if state.config.rps_step > 0 and now_ms - state.last_step_at_ms >= step_interval_ms do
       next_rps = state.current_rps + state.config.rps_step
-      set_worker_rates(state.worker_segments, next_rps / state.config.connections)
+      total_connections = state.config.connections_per_worker * length(state.worker_segments)
+      set_worker_rates(state.worker_segments, next_rps / total_connections)
       IO.puts("[manager][ramp] target_rps=#{next_rps}")
       {%{state | current_rps: next_rps}, now_ms}
     else
@@ -345,6 +388,7 @@ defmodule MoyaSqueezer.Runner do
   defp worker_pids(supervisor) do
     supervisor
     |> Supervisor.which_children()
+    |> Enum.filter(fn {id, _pid, _type, _modules} -> match?({:connection_worker, _, _}, id) end)
     |> Enum.map(fn {_id, pid, _type, _modules} -> pid end)
   end
 
@@ -370,7 +414,7 @@ defmodule MoyaSqueezer.Runner do
     end
   end
 
-  defp worker_children(connection_count, _adapter, _adapter_opts, _logger_name, _stats_name, _payload_size, _read_ratio, _write_ratio, _delete_ratio, _key_pool_name, _requests_per_worker, _mode)
+  defp worker_children(connection_count, _adapter, _adapter_opts, _stats_name, _tick_ms, _worker_inflight_limit, _stats_flush_interval_ms, _payload_size, _read_ratio, _write_ratio, _delete_ratio, _requests_per_worker, _mode, _metrics_log_path, _metrics_flush_interval_ms, _metrics_compact)
        when connection_count <= 0,
        do: []
 
@@ -378,37 +422,60 @@ defmodule MoyaSqueezer.Runner do
          connection_count,
          adapter,
          adapter_opts,
-         logger_name,
          stats_name,
+         tick_ms,
+         worker_inflight_limit,
+         stats_flush_interval_ms,
          payload_size,
          read_ratio,
          write_ratio,
          delete_ratio,
-         key_pool_name,
          requests_per_worker,
-         mode
+         mode,
+         metrics_log_path,
+         metrics_flush_interval_ms,
+         metrics_compact
        ) do
-    Enum.map(1..connection_count, fn id ->
+    local_logger_name = :"metrics_logger_local_#{System.unique_integer([:positive])}"
+    local_task_supervisor_name = :"task_sup_local_#{System.unique_integer([:positive])}"
+
+    logger_child =
+      {MetricsLogger,
+       name: local_logger_name,
+       log_path: metrics_log_path,
+       flush_interval_ms: metrics_flush_interval_ms,
+       compact: metrics_compact}
+
+    task_supervisor_child =
+      {Task.Supervisor,
+       name: local_task_supervisor_name}
+
+    worker_children = Enum.map(1..connection_count, fn id ->
       %{
-        id: {:connection_worker, id},
+        id: {:connection_worker, local_logger_name, id},
         start:
           {ConnectionWorker, :start_link,
            [[
              id: id,
              adapter: adapter,
              adapter_opts: adapter_opts,
-             logger: logger_name,
+             logger: local_logger_name,
+             task_supervisor: local_task_supervisor_name,
              stats_collector: stats_name,
+             tick_ms: tick_ms,
+             worker_inflight_limit: worker_inflight_limit,
+             stats_flush_interval_ms: stats_flush_interval_ms,
              payload_size: payload_size,
              reqs_per_sec: requests_per_worker,
              read_ratio: read_ratio,
              write_ratio: write_ratio,
              delete_ratio: delete_ratio,
-             key_pool: key_pool_name,
              mode: mode
            ]]}
       }
     end)
+
+    [logger_child, task_supervisor_child | worker_children]
   end
 
   defp wait_for_duration_or_signal(duration_ms) do
@@ -442,6 +509,7 @@ defmodule MoyaSqueezer.Runner do
         :duration_elapsed -> "duration_elapsed"
         :error_rate_exceeded -> "error_rate_exceeded"
         :p50_exceeded_baseline_p90 -> "p50_exceeded_baseline_p90"
+        :p50_exceeded_baseline_threshold -> "p50_exceeded_baseline_threshold"
         {:signal, sig} -> Atom.to_string(sig)
       end
 
@@ -459,7 +527,10 @@ defmodule MoyaSqueezer.Runner do
   defp ensure_cluster([]), do: :ok
 
   defp ensure_cluster(worker_nodes) do
-    if Node.alive?() do
+    if Enum.all?(worker_nodes, &(&1 == node())) do
+      :ok
+    else
+      if Node.alive?() do
       Enum.reduce_while(worker_nodes, :ok, fn worker_node, _acc ->
         if Node.connect(worker_node) and Node.ping(worker_node) == :pong do
           {:cont, :ok}
@@ -467,25 +538,13 @@ defmodule MoyaSqueezer.Runner do
           {:halt, {:error, "unable to connect to worker node #{worker_node}"}}
         end
       end)
-    else
-      {:error, "manager node is not distributed; start with --sname/--name and --cookie"}
+      else
+        {:error, "manager node is not distributed; start with --sname/--name and --cookie"}
+      end
     end
   end
 
-  defp distribute_connections(total_connections, nodes) do
-    base = div(total_connections, length(nodes))
-    remainder = rem(total_connections, length(nodes))
-
-    nodes
-    |> Enum.with_index()
-    |> Enum.map(fn {node_name, idx} ->
-      extra = if idx < remainder, do: 1, else: 0
-      {node_name, base + extra}
-    end)
-    |> Enum.into(%{})
-  end
-
-  defp start_segments(nodes, per_node_connections, adapter, logger_name, stats_name, key_pool_name, requests_per_worker, mode, config) do
+  defp start_segments(nodes, per_node_connections, adapter, logger_name, stats_name, requests_per_worker, mode, config) do
     adapter_opts = %{
       base_url: config.base_url,
       request_timeout_ms: config.request_timeout_ms,
@@ -504,7 +563,6 @@ defmodule MoyaSqueezer.Runner do
         adapter_opts,
         logger_name,
         stats_name,
-        key_pool_name,
         requests_per_worker,
         mode,
         config
@@ -512,23 +570,30 @@ defmodule MoyaSqueezer.Runner do
     end)
   end
 
-  defp start_segment_on_node(target_node, node_connections, adapter, adapter_opts, logger_name, stats_name, key_pool_name, requests_per_worker, mode, config) do
+  defp start_segment_on_node(target_node, node_connections, adapter, adapter_opts, logger_name, stats_name, requests_per_worker, mode, config) do
     if node_connections <= 0 do
-      %{node: target_node, supervisor: nil}
+      %{node: target_node, supervisor: nil, metrics_log_path: nil}
     else
+      metrics_log_path = node_metrics_log_path(config.log_path, target_node)
+
       segment_opts = [
         connections: node_connections,
         adapter: adapter,
         adapter_opts: adapter_opts,
         logger: logger_name,
         stats_collector: stats_name,
+        tick_ms: config.worker_tick_ms,
+        worker_inflight_limit: config.worker_inflight_limit,
+        stats_flush_interval_ms: config.stats_flush_interval_ms,
         payload_size: config.payload_size,
         read_ratio: config.read_ratio,
         write_ratio: config.write_ratio,
         delete_ratio: config.delete_ratio,
         requests_per_worker: requests_per_worker,
-        key_pool: key_pool_name,
-        mode: mode
+        mode: mode,
+        metrics_log_path: metrics_log_path,
+        metrics_flush_interval_ms: config.metrics_flush_interval_ms,
+        metrics_compact: config.metrics_compact
       ]
 
       result =
@@ -539,7 +604,8 @@ defmodule MoyaSqueezer.Runner do
         end
 
       case result do
-        {:ok, pid} -> %{node: target_node, supervisor: pid, connections: node_connections}
+        {:ok, pid} ->
+          %{node: target_node, supervisor: pid, connections: node_connections, metrics_log_path: metrics_log_path}
         {:badrpc, reason} -> raise "failed to start worker segment on #{target_node}: #{inspect(reason)}"
         {:error, reason} -> raise "failed to start worker segment on #{target_node}: #{inspect(reason)}"
       end
@@ -618,8 +684,8 @@ defmodule MoyaSqueezer.Runner do
     end)
   end
 
-  defp initial_measured_requests_per_worker(%{ramp_mode: :concurrency}, _start_rps), do: 0.0
-  defp initial_measured_requests_per_worker(config, start_rps), do: start_rps / config.connections
+  defp initial_measured_requests_per_worker(_total_connections, %{ramp_mode: :concurrency}, _start_rps), do: 0.0
+  defp initial_measured_requests_per_worker(total_connections, _config, start_rps), do: start_rps / total_connections
 
   defp validate_ramp_settings(%{ramp_mode: :concurrency} = config, segments) do
     total_workers = length(segments)
@@ -715,5 +781,117 @@ defmodule MoyaSqueezer.Runner do
     else
       :rpc.call(target_node, __MODULE__, :set_worker_rate, [pid, reqs_per_sec])
     end
+  end
+
+  defp node_metrics_log_path(base_log_path, node_name) do
+    ext = Path.extname(base_log_path)
+    root = String.trim_trailing(base_log_path, ext)
+    "#{root}.#{node_name}#{ext}"
+  end
+
+  defp gather_worker_summaries(segments) do
+    segments
+    |> Enum.flat_map(fn
+      %{supervisor: nil} -> []
+      %{node: target_node, supervisor: supervisor} ->
+        summaries =
+          if target_node == node() do
+            worker_segment_summaries(supervisor)
+          else
+            case :rpc.call(target_node, __MODULE__, :worker_segment_summaries, [supervisor]) do
+              list when is_list(list) -> list
+              _ -> []
+            end
+          end
+
+        Enum.map(summaries, fn s -> Map.put(s, :node, target_node) end)
+    end)
+  end
+
+  defp print_worker_summary_table([]) do
+    IO.puts("[manager][workers] workers\tconcurrency\trequests\tavg_rps")
+    IO.puts("[manager][workers] (no worker summaries collected)")
+  end
+
+  defp print_worker_summary_table(rows) do
+    IO.puts("[manager][workers] workers\tconcurrency\trequests\tavg_rps")
+
+    rows
+    |> Enum.group_by(& &1.node)
+    |> Enum.sort_by(fn {node_name, _rows} -> to_string(node_name) end)
+    |> Enum.each(fn {node_name, node_rows} ->
+      total_requests = Enum.reduce(node_rows, 0, fn row, acc -> acc + row.measured_requests end)
+      worker_count = length(node_rows)
+      avg_rps = Enum.reduce(node_rows, 0.0, fn row, acc -> acc + row.avg_rps end)
+
+      IO.puts(
+        "[manager][workers] #{node_name}\t#{worker_count}\t#{total_requests}\t#{Float.round(avg_rps, 2)}"
+      )
+    end)
+  end
+
+  defp print_halt_summary(config, stats_collector, worker_summaries) do
+    snapshot = StatsCollector.last_emitted_window_snapshot(stats_collector)
+    aggregate_rps = snapshot.count
+    avg_payload_size = config.payload_size
+    concurrent_connections = length(worker_summaries)
+
+    IO.puts(
+      "[manager] This squeeze test ran until aggregate_rps=#{aggregate_rps} " <>
+        "avg_payload_size=#{avg_payload_size}B " <>
+        "concurrent_db_connections=#{concurrent_connections}"
+    )
+  end
+
+  defp merge_worker_metric_logs(_manager_log_path, []), do: :ok
+
+  defp merge_worker_metric_logs(manager_log_path, segments) do
+    contents =
+      Enum.map(segments, fn %{node: target_node, metrics_log_path: log_path} ->
+        if is_nil(log_path) do
+          ""
+        else
+        result =
+          if target_node == node() do
+            read_metrics_file(log_path)
+          else
+            :rpc.call(target_node, __MODULE__, :read_metrics_file, [log_path])
+          end
+
+        case result do
+          {:ok, body} -> body
+          _ -> ""
+        end
+        end
+      end)
+
+    merged =
+      contents
+      |> Enum.with_index()
+      |> Enum.map(fn {body, idx} ->
+        if idx == 0 do
+          body
+        else
+          body
+          |> String.split("\n", parts: 2)
+          |> case do
+            [_header, rest] -> rest
+            [_only] -> ""
+            _ -> ""
+          end
+        end
+      end)
+      |> Enum.join("")
+
+    File.mkdir_p!(Path.dirname(manager_log_path))
+    File.write!(manager_log_path, merged)
+    :ok
+  end
+
+  defp format_2dp(value) when is_integer(value), do: format_2dp(value / 1)
+  defp format_2dp(value) when is_float(value), do: :erlang.float_to_binary(value, decimals: 2)
+
+  defp percentile_label(p) when is_float(p) do
+    "p#{trunc(p * 100)}"
   end
 end
