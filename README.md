@@ -153,6 +153,7 @@ The script writes one run log per interval and a summary CSV with:
 - `max_active_workers`: Max active workers in `concurrency` mode (default `connections_per_worker`).
 - `baseline_window_seconds`: Baseline measurement window after burn-in, used to compute baseline p90 (default `10`).
 - `max_error_rate_pct`: Error-rate stop threshold percentage for measured phase (default `1.0`).
+- `error_breach_consecutive_windows`: Number of consecutive measured windows with error rate above `max_error_rate_pct` required before stopping (default `1`).
 - `stop_latency_percentile`: Baseline percentile used for latency stop threshold (default `0.90`, i.e. p90).
 - `latency_breach_consecutive_windows`: Number of consecutive measured windows with `p50 > baseline_percentile` required before stopping (default `1`).
 - `worker_tick_ms`: Worker token-bucket scheduler interval in ms (default `10`).

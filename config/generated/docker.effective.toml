@@ -5,10 +5,12 @@ rps_step = 50
 step_interval_seconds = 5
 baseline_window_seconds = 10
 max_error_rate_pct = 1.0
+error_breach_consecutive_windows = 5
 stop_latency_percentile = 0.95
 latency_breach_consecutive_windows = 5
 worker_tick_ms = 10
 worker_inflight_limit = 25
+worker_step_interval_seconds = 5
 
 read_ratio = 0.70
 write_ratio = 0.25
@@ -36,9 +38,8 @@ write_path = "/db/v0.1"
 delete_path = "/db/v0.1"
 
 log_path = "logs/squeeze_metrics.csv"
-worker_step_interval_seconds = 1
 worker_step = 1
-initial_active_workers = 3
+initial_active_workers = 4
 ramp_mode = "concurrency"
-max_active_workers = 100
+max_active_workers = 20
 total_target_rps = 10000

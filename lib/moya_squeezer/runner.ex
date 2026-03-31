@@ -270,7 +270,7 @@ defmodule MoyaSqueezer.Runner do
     :ok
   end
 
-  defp run_squeeze_control_loop(config, stats_collector, worker_segments, start_rps, duration_seconds, opts \\ []) do
+  defp run_squeeze_control_loop(config, stats_collector, worker_segments, start_rps, duration_seconds, opts) do
     started_at_ms = System.monotonic_time(:millisecond)
     deadline_ms = started_at_ms + duration_seconds * 1_000
 
@@ -301,8 +301,10 @@ defmodule MoyaSqueezer.Runner do
             logger_name: Keyword.get(opts, :logger_name),
             stats_name: Keyword.get(opts, :stats_name),
             baseline_latency_ms: baseline_latency_ms,
+            error_breach_streak: 0,
             latency_breach_streak: 0,
             last_step_at_ms: now_ms,
+            next_worker_step_due_ms: now_ms + config.worker_step_interval_seconds * 1_000,
             deadline_ms: deadline_ms
           })
         end
@@ -325,23 +327,35 @@ defmodule MoyaSqueezer.Runner do
           true ->
             snapshot = StatsCollector.window_snapshot(state.stats_collector)
 
+            next_error_streak =
+              if snapshot.error_rate_pct > state.config.max_error_rate_pct,
+                do: state.error_breach_streak + 1,
+                else: 0
+
             cond do
-              snapshot.error_rate_pct > state.config.max_error_rate_pct -> :error_rate_exceeded
+              next_error_streak >= state.config.error_breach_consecutive_windows ->
+                :error_rate_exceeded
+
               snapshot.count > 0 ->
-                next_streak =
+                next_latency_streak =
                   if snapshot.p50_latency_ms > state.baseline_latency_ms,
                     do: state.latency_breach_streak + 1,
                     else: 0
 
-                if next_streak >= state.config.latency_breach_consecutive_windows do
+                if next_latency_streak >= state.config.latency_breach_consecutive_windows do
                   :p50_exceeded_baseline_threshold
                 else
-                  {next_state, next_step_ms} = maybe_step_load(%{state | latency_breach_streak: next_streak}, now_ms)
+                  {next_state, next_step_ms} =
+                    maybe_step_load(
+                      %{state | error_breach_streak: next_error_streak, latency_breach_streak: next_latency_streak},
+                      now_ms
+                    )
+
                   ramp_loop(%{next_state | last_step_at_ms: next_step_ms})
                 end
 
               true ->
-                {next_state, next_step_ms} = maybe_step_load(state, now_ms)
+                {next_state, next_step_ms} = maybe_step_load(%{state | error_breach_streak: next_error_streak}, now_ms)
                 ramp_loop(%{next_state | last_step_at_ms: next_step_ms})
             end
         end
@@ -369,12 +383,13 @@ defmodule MoyaSqueezer.Runner do
 
   defp maybe_step_workers(state, now_ms) do
     step_interval_ms = state.config.worker_step_interval_seconds * 1_000
+    next_due_ms = Map.get(state, :next_worker_step_due_ms, state.last_step_at_ms + step_interval_ms)
 
-    state = maybe_activate_candidate_workers(state)
-    max_active = min(state.config.max_active_workers, available_worker_count(state.worker_segments))
-
-    if state.config.worker_step > 0 and now_ms - state.last_step_at_ms >= step_interval_ms do
+    if state.config.worker_step > 0 and now_ms >= next_due_ms do
+      state = maybe_activate_candidate_workers(state, state.config.worker_step)
+      max_active = min(state.config.max_active_workers, available_worker_count(state.worker_segments))
       next_active = min(state.active_workers + state.config.worker_step, max_active)
+      advanced_due_ms = next_due_ms + step_interval_ms
 
       if next_active > state.active_workers do
         set_active_worker_count(
@@ -386,21 +401,21 @@ defmodule MoyaSqueezer.Runner do
         per_worker = state.total_target_rps / max(next_active, 1)
 
         IO.puts(
-          "[manager][ramp] active_workers=#{next_active} " <>
+          "[manager][ramp] ts_ms=#{now_ms} active_workers=#{next_active} " <>
             "target_total_rps=#{state.total_target_rps} " <>
             "target_rps_per_worker=#{Float.round(per_worker, 2)}"
         )
 
-        {%{state | active_workers: next_active}, now_ms}
+        {%{state | active_workers: next_active, next_worker_step_due_ms: advanced_due_ms}, state.last_step_at_ms}
       else
-        {state, state.last_step_at_ms}
+        {%{state | next_worker_step_due_ms: advanced_due_ms}, state.last_step_at_ms}
       end
     else
       {state, state.last_step_at_ms}
     end
   end
 
-  defp maybe_activate_candidate_workers(state) do
+  defp maybe_activate_candidate_workers(state, max_new) do
     candidate_nodes = Map.get(state, :candidate_worker_nodes, [])
     known_nodes = MapSet.new(Enum.map(state.worker_segments, & &1.node))
 
@@ -414,28 +429,33 @@ defmodule MoyaSqueezer.Runner do
       delete_path: state.config.delete_path
     }
 
-    {segments, changed?} =
-      Enum.reduce(candidate_nodes, {state.worker_segments, false}, fn n, {segments_acc, changed_acc} ->
-        if MapSet.member?(known_nodes, n) do
-          {segments_acc, changed_acc}
+    {segments, changed?, _added_count} =
+      Enum.reduce_while(candidate_nodes, {state.worker_segments, false, 0}, fn n, {segments_acc, changed_acc, added_acc} ->
+        if max_new != :infinity and added_acc >= max_new do
+          {:halt, {segments_acc, changed_acc, added_acc}}
         else
-          if Node.connect(n) and Node.ping(n) == :pong do
-            segment =
-              start_segment_on_node(
-                n,
-                state.config.connections_per_worker,
-                state.adapter,
-                adapter_opts,
-                state.logger_name,
-                state.stats_name,
-                0.0,
-                :measured,
-                state.config
-              )
-
-            {segments_acc ++ [segment], true}
+          if MapSet.member?(known_nodes, n) do
+            {:cont, {segments_acc, changed_acc, added_acc}}
           else
-            {segments_acc, changed_acc}
+            if Node.connect(n) and Node.ping(n) == :pong do
+              segment =
+                start_segment_on_node(
+                  n,
+                  state.config.connections_per_worker,
+                  state.adapter,
+                  adapter_opts,
+                  state.logger_name,
+                  state.stats_name,
+                  0.0,
+                  :measured,
+                  state.config
+                )
+
+              IO.puts("[manager][ramp] ts_ms=#{System.monotonic_time(:millisecond)} candidate worker joined node=#{n}")
+              {:cont, {segments_acc ++ [segment], true, added_acc + 1}}
+            else
+              {:cont, {segments_acc, changed_acc, added_acc}}
+            end
           end
         end
       end)

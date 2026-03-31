@@ -20,6 +20,7 @@ defmodule MoyaSqueezer.ConfigTest do
     assert config.step_interval_seconds == 5
     assert config.baseline_window_seconds == 10
     assert config.max_error_rate_pct == 1.0
+    assert config.error_breach_consecutive_windows == 1
     assert config.stop_latency_percentile == 0.9
     assert config.latency_breach_consecutive_windows == 1
     assert config.worker_tick_ms == 10
@@ -157,6 +158,22 @@ defmodule MoyaSqueezer.ConfigTest do
     }
 
     assert {:error, "optional field must be > 0: worker_inflight_limit"} =
+             Config.from_map(map)
+  end
+
+  test "from_map rejects non-positive error_breach_consecutive_windows" do
+    map = %{
+      connections_per_worker: 2,
+      requests_per_second: 100,
+      read_ratio: 0.7,
+      write_ratio: 0.2,
+      delete_ratio: 0.1,
+      payload_size: 128,
+      duration_seconds: 5,
+      error_breach_consecutive_windows: 0
+    }
+
+    assert {:error, "optional field must be > 0: error_breach_consecutive_windows"} =
              Config.from_map(map)
   end
 
