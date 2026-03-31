@@ -1,8 +1,8 @@
 connections_per_worker = 25
 requests_per_second = 500
-start_requests_per_second = 5000
-rps_step = 500
-step_interval_seconds = 1
+start_requests_per_second = 1500
+rps_step = 50
+step_interval_seconds = 5
 baseline_window_seconds = 10
 max_error_rate_pct = 1.0
 stop_latency_percentile = 0.95
@@ -36,4 +36,9 @@ write_path = "/db/v0.1"
 delete_path = "/db/v0.1"
 
 log_path = "logs/squeeze_metrics.csv"
-ramp_mode = "rps"
+worker_step_interval_seconds = 1
+worker_step = 1
+initial_active_workers = 3
+ramp_mode = "concurrency"
+max_active_workers = 100
+total_target_rps = 10000

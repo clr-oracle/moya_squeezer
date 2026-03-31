@@ -20,9 +20,10 @@ defmodule MoyaSqueezer.Runner do
   @spec run(Config.t(), keyword()) :: :ok | {:error, term()}
   def run(config, opts \\ []) do
     worker_nodes = Keyword.get(opts, :worker_nodes, [])
+    candidate_worker_nodes = Keyword.get(opts, :candidate_worker_nodes, worker_nodes)
 
     with :ok <- ensure_cluster(worker_nodes) do
-      run_manager(config, worker_nodes)
+      run_manager(config, worker_nodes, candidate_worker_nodes)
     end
   end
 
@@ -83,11 +84,6 @@ defmodule MoyaSqueezer.Runner do
   @spec read_metrics_file(String.t()) :: {:ok, binary()} | {:error, term()}
   def read_metrics_file(path), do: File.read(path)
 
-  @spec set_worker_rate(pid(), float()) :: :ok
-  def set_worker_rate(worker_pid, reqs_per_sec) do
-    ConnectionWorker.set_reqs_per_sec(worker_pid, reqs_per_sec)
-  end
-
   @spec set_worker_segment_mode(pid(), :warmup | :measured) :: :ok
   def set_worker_segment_mode(supervisor, mode) when mode in [:warmup, :measured] do
     supervisor
@@ -97,7 +93,7 @@ defmodule MoyaSqueezer.Runner do
     :ok
   end
 
-  defp run_manager(config, worker_nodes) do
+  defp run_manager(config, worker_nodes, candidate_worker_nodes) do
     adapter = Application.get_env(:moya_squeezer, :load_adapter, MoyaSqueezer.Adapters.HttpAdapter)
     start_rps = config.start_requests_per_second
     nodes = Enum.uniq(worker_nodes)
@@ -136,7 +132,8 @@ defmodule MoyaSqueezer.Runner do
             stats_name,
             start_rps,
             supervisor,
-            stats_collector
+            stats_collector,
+            candidate_worker_nodes
           )
 
         :rps ->
@@ -194,7 +191,7 @@ defmodule MoyaSqueezer.Runner do
     end
   end
 
-  defp run_manager_concurrency_mode(config, nodes, per_node_connections, total_connections, adapter, logger_name, stats_name, start_rps, supervisor, stats_collector) do
+  defp run_manager_concurrency_mode(config, nodes, per_node_connections, total_connections, adapter, logger_name, stats_name, start_rps, supervisor, stats_collector, candidate_worker_nodes) do
     segments =
       start_segments(
         nodes,
@@ -221,7 +218,12 @@ defmodule MoyaSqueezer.Runner do
       try do
         with :ok <- validate_ramp_settings(config, segments) do
           maybe_initialize_concurrency_ramp(config, segments, start_rps)
-          run_measured_phase(config, stats_collector, segments, start_rps, supervisor)
+          run_measured_phase(config, stats_collector, segments, start_rps, supervisor,
+            candidate_worker_nodes: candidate_worker_nodes,
+            adapter: adapter,
+            logger_name: logger_name,
+            stats_name: stats_name
+          )
         else
           {:error, reason} -> {:error, reason}
         end
@@ -235,7 +237,7 @@ defmodule MoyaSqueezer.Runner do
     end
   end
 
-  defp run_measured_phase(config, stats_collector, measured_segments, start_rps, supervisor) do
+  defp run_measured_phase(config, stats_collector, measured_segments, start_rps, supervisor, opts \\ []) do
     signal_setup = install_signal_handlers()
 
     {stop_reason, worker_summaries} =
@@ -246,7 +248,8 @@ defmodule MoyaSqueezer.Runner do
             stats_collector,
             measured_segments,
             start_rps,
-            config.duration_seconds
+            config.duration_seconds,
+            opts
           )
 
         worker_summaries = gather_worker_summaries(measured_segments)
@@ -267,7 +270,7 @@ defmodule MoyaSqueezer.Runner do
     :ok
   end
 
-  defp run_squeeze_control_loop(config, stats_collector, worker_segments, start_rps, duration_seconds) do
+  defp run_squeeze_control_loop(config, stats_collector, worker_segments, start_rps, duration_seconds, opts \\ []) do
     started_at_ms = System.monotonic_time(:millisecond)
     deadline_ms = started_at_ms + duration_seconds * 1_000
 
@@ -293,6 +296,10 @@ defmodule MoyaSqueezer.Runner do
             current_rps: start_rps,
             active_workers: initial_active_workers(config, worker_segments),
             total_target_rps: config.total_target_rps,
+            candidate_worker_nodes: Keyword.get(opts, :candidate_worker_nodes, []),
+            adapter: Keyword.get(opts, :adapter),
+            logger_name: Keyword.get(opts, :logger_name),
+            stats_name: Keyword.get(opts, :stats_name),
             baseline_latency_ms: baseline_latency_ms,
             latency_breach_streak: 0,
             last_step_at_ms: now_ms,
@@ -363,11 +370,19 @@ defmodule MoyaSqueezer.Runner do
   defp maybe_step_workers(state, now_ms) do
     step_interval_ms = state.config.worker_step_interval_seconds * 1_000
 
+    state = maybe_activate_candidate_workers(state)
+    max_active = min(state.config.max_active_workers, available_worker_count(state.worker_segments))
+
     if state.config.worker_step > 0 and now_ms - state.last_step_at_ms >= step_interval_ms do
-      next_active = min(state.active_workers + state.config.worker_step, state.config.max_active_workers)
+      next_active = min(state.active_workers + state.config.worker_step, max_active)
 
       if next_active > state.active_workers do
-        set_active_worker_count(state.worker_segments, next_active, state.total_target_rps)
+        set_active_worker_count(
+          state.worker_segments,
+          next_active,
+          state.total_target_rps,
+          state.config.connections_per_worker
+        )
         per_worker = state.total_target_rps / max(next_active, 1)
 
         IO.puts(
@@ -383,6 +398,49 @@ defmodule MoyaSqueezer.Runner do
     else
       {state, state.last_step_at_ms}
     end
+  end
+
+  defp maybe_activate_candidate_workers(state) do
+    candidate_nodes = Map.get(state, :candidate_worker_nodes, [])
+    known_nodes = MapSet.new(Enum.map(state.worker_segments, & &1.node))
+
+    adapter_opts = %{
+      base_url: state.config.base_url,
+      request_timeout_ms: state.config.request_timeout_ms,
+      max_retries: state.config.max_retries,
+      retry_backoff_ms: state.config.retry_backoff_ms,
+      read_path: state.config.read_path,
+      write_path: state.config.write_path,
+      delete_path: state.config.delete_path
+    }
+
+    {segments, changed?} =
+      Enum.reduce(candidate_nodes, {state.worker_segments, false}, fn n, {segments_acc, changed_acc} ->
+        if MapSet.member?(known_nodes, n) do
+          {segments_acc, changed_acc}
+        else
+          if Node.connect(n) and Node.ping(n) == :pong do
+            segment =
+              start_segment_on_node(
+                n,
+                state.config.connections_per_worker,
+                state.adapter,
+                adapter_opts,
+                state.logger_name,
+                state.stats_name,
+                0.0,
+                :measured,
+                state.config
+              )
+
+            {segments_acc ++ [segment], true}
+          else
+            {segments_acc, changed_acc}
+          end
+        end
+      end)
+
+    if changed?, do: %{state | worker_segments: segments}, else: state
   end
 
   defp worker_pids(supervisor) do
@@ -695,11 +753,10 @@ defmodule MoyaSqueezer.Runner do
     cond do
       config.initial_active_workers > available_workers ->
         {:error,
-         "initial_active_workers (#{config.initial_active_workers}) exceeds available workers with connections (#{available_workers}/#{total_workers}, connections=#{total_connections})"}
+         "initial_active_workers (#{config.initial_active_workers}) exceeds available worker containers (#{available_workers}/#{total_workers}, connections=#{total_connections})"}
 
       config.max_active_workers > available_workers ->
-        {:error,
-         "max_active_workers (#{config.max_active_workers}) exceeds available workers with connections (#{available_workers}/#{total_workers}, connections=#{total_connections}). Increase connections or reduce max_active_workers."}
+        :ok
 
       config.max_active_workers < config.initial_active_workers ->
         {:error,
@@ -713,7 +770,12 @@ defmodule MoyaSqueezer.Runner do
   defp validate_ramp_settings(_config, _segments), do: :ok
 
   defp maybe_initialize_concurrency_ramp(%{ramp_mode: :concurrency} = config, segments, _start_rps) do
-    set_active_worker_count(segments, config.initial_active_workers, config.total_target_rps)
+    set_active_worker_count(
+      segments,
+      config.initial_active_workers,
+      config.total_target_rps,
+      config.connections_per_worker
+    )
 
     per_worker = config.total_target_rps / max(config.initial_active_workers, 1)
 
@@ -731,57 +793,42 @@ defmodule MoyaSqueezer.Runner do
   defp initial_active_workers(%{ramp_mode: :concurrency} = config, _segments), do: config.initial_active_workers
   defp initial_active_workers(_config, segments), do: Enum.count(segments, & &1.supervisor)
 
-  defp set_active_worker_count(segments, active_workers, total_target_rps) do
-    workers = all_worker_refs(segments)
+  defp set_active_worker_count(segments, active_workers, total_target_rps, connections_per_worker) do
+    workers = available_worker_segments(segments)
     active_count = min(active_workers, length(workers))
-    reqs_per_worker = if active_count > 0, do: total_target_rps / active_count, else: 0.0
+
+    reqs_per_container = if active_count > 0, do: total_target_rps / active_count, else: 0.0
+    reqs_per_process = reqs_per_container / max(connections_per_worker, 1)
 
     workers
     |> Enum.with_index()
-    |> Enum.each(fn {worker_ref, idx} ->
-      rate = if idx < active_count, do: reqs_per_worker, else: 0.0
-      set_worker_ref_rate(worker_ref, rate)
+    |> Enum.each(fn {worker_segment, idx} ->
+      rate = if idx < active_count, do: reqs_per_process, else: 0.0
+      set_segment_rate(worker_segment, rate)
     end)
   end
 
   defp available_worker_count(segments) do
     segments
-    |> all_worker_refs()
+    |> available_worker_segments()
     |> length()
   end
 
-  defp all_worker_refs(segments) do
+  defp available_worker_segments(segments) do
     segments
-    |> Enum.flat_map(fn
-      %{supervisor: nil} ->
-        []
-
-      %{node: target_node, supervisor: supervisor} ->
-        pids =
-          if target_node == node() do
-            worker_segment_pids(supervisor)
-          else
-            case :rpc.call(target_node, __MODULE__, :worker_segment_pids, [supervisor]) do
-              pids when is_list(pids) -> pids
-              _ -> []
-            end
-          end
-
-        pids
-        |> Enum.filter(&is_pid/1)
-        |> Enum.map(fn pid -> %{node: target_node, pid: pid} end)
-    end)
+    |> Enum.filter(& &1.supervisor)
+    |> Enum.sort_by(fn %{node: node_name} -> to_string(node_name) end)
   end
 
-  defp set_worker_ref_rate(%{pid: pid}, _reqs_per_sec) when not is_pid(pid), do: :ok
-
-  defp set_worker_ref_rate(%{node: target_node, pid: pid}, reqs_per_sec) do
+  defp set_segment_rate(%{node: target_node, supervisor: supervisor}, reqs_per_worker) when is_pid(supervisor) do
     if target_node == node() do
-      set_worker_rate(pid, reqs_per_sec)
+      set_worker_segment_rate(supervisor, reqs_per_worker)
     else
-      :rpc.call(target_node, __MODULE__, :set_worker_rate, [pid, reqs_per_sec])
+      :rpc.call(target_node, __MODULE__, :set_worker_segment_rate, [supervisor, reqs_per_worker])
     end
   end
+
+  defp set_segment_rate(_segment, _reqs_per_worker), do: :ok
 
   defp node_metrics_log_path(base_log_path, node_name) do
     ext = Path.extname(base_log_path)
