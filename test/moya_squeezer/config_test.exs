@@ -33,7 +33,7 @@ defmodule MoyaSqueezer.ConfigTest do
     assert config.initial_active_workers == 1
     assert config.worker_step == 1
     assert config.worker_step_interval_seconds == 5
-    assert config.max_active_workers == 2
+    assert config.worker_container_pool == 2
   end
 
   test "from_map accepts explicit squeeze fields" do
@@ -186,7 +186,7 @@ defmodule MoyaSqueezer.ConfigTest do
       initial_active_workers: 2,
       worker_step: 1,
       worker_step_interval_seconds: 3,
-      max_active_workers: 4,
+      worker_container_pool: 4,
       read_ratio: 0.7,
       write_ratio: 0.2,
       delete_ratio: 0.1,
@@ -200,6 +200,6 @@ defmodule MoyaSqueezer.ConfigTest do
     assert config.initial_active_workers == 2
     assert config.worker_step == 1
     assert config.worker_step_interval_seconds == 3
-    assert config.max_active_workers == 4
+    assert config.worker_container_pool == 4
   end
 end

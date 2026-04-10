@@ -5,6 +5,8 @@ defmodule MoyaSqueezer.ConnectionWorker do
 
   use GenServer
 
+  alias MoyaSqueezer.RuntimeState
+
   @default_tick_ms 10
   @default_stats_flush_interval_ms 100
 
@@ -67,11 +69,20 @@ defmodule MoyaSqueezer.ConnectionWorker do
   @spec set_reqs_per_sec(pid() | atom(), float()) :: :ok
   def set_reqs_per_sec(worker, reqs_per_sec), do: GenServer.cast(worker, {:set_reqs_per_sec, reqs_per_sec})
 
+  @spec set_payload_size(pid() | atom(), pos_integer()) :: :ok
+  def set_payload_size(worker, payload_size), do: GenServer.cast(worker, {:set_payload_size, payload_size})
+
   @spec set_mode(pid() | atom(), :warmup | :measured) :: :ok
   def set_mode(worker, mode) when mode in [:warmup, :measured], do: GenServer.cast(worker, {:set_mode, mode})
 
   @spec summary(pid() | atom()) :: map()
   def summary(worker), do: GenServer.call(worker, :summary, 10_000)
+
+  @spec export_keyspace(pid() | atom()) :: [String.t()]
+  def export_keyspace(worker), do: GenServer.call(worker, :export_keyspace, 10_000)
+
+  @spec import_keyspace(pid() | atom(), [String.t()]) :: :ok
+  def import_keyspace(worker, keys) when is_list(keys), do: GenServer.call(worker, {:import_keyspace, keys}, 10_000)
 
   @impl true
   def init(opts) do
@@ -138,6 +149,8 @@ defmodule MoyaSqueezer.ConnectionWorker do
 
   @impl true
   def handle_info({:request_result, request_type, key, started_at_ms, response_code, db_latency_us, dispatched_mode}, state) do
+    RuntimeState.record_worker_response(response_code)
+
     state_after_pool = maybe_update_local_key_pool(request_type, key, response_code, state)
 
     metric = %{
@@ -159,6 +172,11 @@ defmodule MoyaSqueezer.ConnectionWorker do
   @impl true
   def handle_cast({:set_reqs_per_sec, reqs_per_sec}, state) when is_number(reqs_per_sec) do
     {:noreply, %{state | reqs_per_sec: reqs_per_sec / 1}}
+  end
+
+  @impl true
+  def handle_cast({:set_payload_size, payload_size}, state) when is_integer(payload_size) and payload_size > 0 do
+    {:noreply, %{state | payload_size: payload_size}}
   end
 
   @impl true
@@ -186,6 +204,21 @@ defmodule MoyaSqueezer.ConnectionWorker do
 
     {:reply,
      %{id: state.id, node: node(), measured_requests: state.measured_requests, avg_rps: avg_rps}, state}
+  end
+
+  @impl true
+  def handle_call(:export_keyspace, _from, state) do
+    {:reply, state.local_key_list, state}
+  end
+
+  @impl true
+  def handle_call({:import_keyspace, keys}, _from, state) do
+    imported =
+      Enum.reduce(keys, state.local_keys, fn key, acc ->
+        if is_binary(key), do: MapSet.put(acc, key), else: acc
+      end)
+
+    {:reply, :ok, %{state | local_keys: imported, local_key_list: MapSet.to_list(imported)}}
   end
 
   @impl true

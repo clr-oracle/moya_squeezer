@@ -4,8 +4,8 @@ defmodule MoyaSqueezer.Config do
   """
 
   @required_integer_fields ~w(connections_per_worker requests_per_second payload_size duration_seconds)a
-  @optional_nonneg_integer_fields ~w(max_retries retry_backoff_ms warmup_seconds rps_step)a
-  @optional_positive_integer_fields ~w(request_timeout_ms step_interval_seconds baseline_window_seconds worker_tick_ms worker_inflight_limit metrics_flush_interval_ms stats_flush_interval_ms total_target_rps initial_active_workers worker_step worker_step_interval_seconds max_active_workers latency_breach_consecutive_windows error_breach_consecutive_windows)a
+  @optional_nonneg_integer_fields ~w(max_retries retry_backoff_ms warmup_seconds rps_step feel_the_burn_seconds payload_step_bytes)a
+  @optional_positive_integer_fields ~w(request_timeout_ms step_interval_seconds baseline_window_seconds worker_tick_ms worker_inflight_limit metrics_flush_interval_ms stats_flush_interval_ms total_target_rps initial_active_workers worker_step worker_step_interval_seconds worker_container_pool max_active_workers latency_breach_consecutive_windows error_breach_consecutive_windows)a
   @required_ratio_fields ~w(read_ratio write_ratio delete_ratio)a
 
   @enforce_keys [
@@ -30,6 +30,7 @@ defmodule MoyaSqueezer.Config do
     :error_breach_consecutive_windows,
     :stop_latency_percentile,
     :latency_breach_consecutive_windows,
+    :feel_the_burn_seconds,
     :worker_tick_ms,
     :worker_inflight_limit,
     :metrics_flush_interval_ms,
@@ -40,7 +41,8 @@ defmodule MoyaSqueezer.Config do
     :initial_active_workers,
     :worker_step,
     :worker_step_interval_seconds,
-    :max_active_workers
+    :worker_container_pool,
+    :payload_step_bytes
   ]
   defstruct [
     :connections_per_worker,
@@ -64,6 +66,7 @@ defmodule MoyaSqueezer.Config do
     :error_breach_consecutive_windows,
     :stop_latency_percentile,
     :latency_breach_consecutive_windows,
+    :feel_the_burn_seconds,
     :worker_tick_ms,
     :worker_inflight_limit,
     :metrics_flush_interval_ms,
@@ -74,7 +77,8 @@ defmodule MoyaSqueezer.Config do
     :initial_active_workers,
     :worker_step,
     :worker_step_interval_seconds,
-    :max_active_workers,
+    :worker_container_pool,
+    :payload_step_bytes,
     read_path: "/db/v0.1",
     write_path: "/db/v0.1",
     delete_path: "/db/v0.1"
@@ -102,6 +106,7 @@ defmodule MoyaSqueezer.Config do
           error_breach_consecutive_windows: pos_integer(),
           stop_latency_percentile: float(),
           latency_breach_consecutive_windows: pos_integer(),
+          feel_the_burn_seconds: non_neg_integer(),
           worker_tick_ms: pos_integer(),
           worker_inflight_limit: pos_integer(),
           metrics_flush_interval_ms: pos_integer(),
@@ -112,7 +117,8 @@ defmodule MoyaSqueezer.Config do
           initial_active_workers: pos_integer(),
           worker_step: pos_integer(),
           worker_step_interval_seconds: pos_integer(),
-          max_active_workers: pos_integer(),
+          worker_container_pool: pos_integer(),
+          payload_step_bytes: non_neg_integer(),
           read_path: String.t(),
           write_path: String.t(),
           delete_path: String.t()
@@ -169,6 +175,7 @@ defmodule MoyaSqueezer.Config do
          stop_latency_percentile: ratio(fetch_optional(map, :stop_latency_percentile, 0.90)),
          latency_breach_consecutive_windows:
            fetch_optional(map, :latency_breach_consecutive_windows, 1),
+          feel_the_burn_seconds: fetch_optional(map, :feel_the_burn_seconds, 0),
          worker_tick_ms: fetch_optional(map, :worker_tick_ms, 10),
          worker_inflight_limit: fetch_optional(map, :worker_inflight_limit, 1),
          metrics_flush_interval_ms: fetch_optional(map, :metrics_flush_interval_ms, 10),
@@ -179,7 +186,13 @@ defmodule MoyaSqueezer.Config do
          initial_active_workers: fetch_optional(map, :initial_active_workers, 1),
          worker_step: fetch_optional(map, :worker_step, 1),
          worker_step_interval_seconds: fetch_optional(map, :worker_step_interval_seconds, fetch_optional(map, :step_interval_seconds, 5)),
-         max_active_workers: fetch_optional(map, :max_active_workers, fetch_required(map, :connections_per_worker)),
+         worker_container_pool:
+           fetch_optional(
+             map,
+             :worker_container_pool,
+             fetch_optional(map, :max_active_workers, fetch_required(map, :connections_per_worker))
+           ),
+         payload_step_bytes: fetch_optional(map, :payload_step_bytes, 1024),
          read_path: fetch_optional(map, :read_path, "/db/v0.1"),
          write_path: fetch_optional(map, :write_path, "/db/v0.1"),
          delete_path: fetch_optional(map, :delete_path, "/db/v0.1")
@@ -295,13 +308,14 @@ defmodule MoyaSqueezer.Config do
 
   defp validate_ramp_mode(map) do
     case parse_ramp_mode(fetch_optional(map, :ramp_mode, "rps")) do
-      mode when mode in [:rps, :concurrency] -> :ok
-      _ -> {:error, "ramp_mode must be one of: rps, concurrency"}
+      mode when mode in [:rps, :concurrency, :payload] -> :ok
+      _ -> {:error, "ramp_mode must be one of: rps, concurrency, payload"}
     end
   end
 
   defp parse_ramp_mode(value) when value in [:rps, "rps"], do: :rps
   defp parse_ramp_mode(value) when value in [:concurrency, "concurrency"], do: :concurrency
+  defp parse_ramp_mode(value) when value in [:payload, "payload"], do: :payload
   defp parse_ramp_mode(_), do: :invalid
 
   defp ratio(value) when is_integer(value), do: value / 1

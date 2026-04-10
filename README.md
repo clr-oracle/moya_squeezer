@@ -48,6 +48,20 @@ Or run the Mix task directly as manager:
 mix squeezer.run config/local.toml --role manager
 ```
 
+### Select HTTP adapter
+
+You can choose request adapter at runtime:
+
+- Finch (default): `--adapter finch`
+- OTP inets/httpc: `--adapter httpc`
+
+Examples:
+
+```bash
+mix squeezer.run config/local.toml --role manager --adapter finch
+mix squeezer.run config/local.toml --role manager --adapter httpc
+```
+
 ## Distributed manager/worker mode
 
 This app can run in two roles:
@@ -138,6 +152,20 @@ The script writes one run log per interval and a summary CSV with:
 
 `interval_ms,stop_reason,total,error_rate_pct,p95_ms,run_log`
 
+## Benchmarking Finch vs httpc side-by-side
+
+Use:
+
+```bash
+zsh scripts/benchmark_adapters.sh config/local.toml
+```
+
+Optional env vars:
+
+- `ADAPTERS` (default `finch,httpc`)
+- `OUT_DIR` (default `logs`)
+- `RUN_CMD` (default `./scripts/squeezer.sh`)
+
 ## Config fields (TOML)
 
 - `connections_per_worker`: Number of concurrent connection workers per worker node.
@@ -150,7 +178,7 @@ The script writes one run log per interval and a summary CSV with:
 - `initial_active_workers`: Starting active worker count in `concurrency` mode (default `1`).
 - `worker_step`: Active workers to add per ramp step in `concurrency` mode (default `1`).
 - `worker_step_interval_seconds`: Seconds between worker activation steps in `concurrency` mode (default `step_interval_seconds`).
-- `max_active_workers`: Max active workers in `concurrency` mode (default `connections_per_worker`).
+- `worker_container_pool`: Required total worker containers for `concurrency` mode. Manager requires discovered workers to equal this value before run start (defaults to legacy `max_active_workers` if present, else `connections_per_worker`).
 - `baseline_window_seconds`: Baseline measurement window after burn-in, used to compute baseline p90 (default `10`).
 - `max_error_rate_pct`: Error-rate stop threshold percentage for measured phase (default `1.0`).
 - `error_breach_consecutive_windows`: Number of consecutive measured windows with error rate above `max_error_rate_pct` required before stopping (default `1`).
@@ -212,7 +240,7 @@ After burn-in, the runner:
 2. Captures baseline p90 latency.
 3. Ramps load according to `ramp_mode`:
    - `rps`: starts/increments target RPS from `start_requests_per_second` by `rps_step` every `step_interval_seconds`.
-   - `concurrency`: starts with `initial_active_workers` and activates additional workers by `worker_step` every `worker_step_interval_seconds` up to `max_active_workers`, redistributing `total_target_rps` across active workers.
+  - `concurrency`: starts with `initial_active_workers` and activates additional workers by `worker_step` every `worker_step_interval_seconds` up to `worker_container_pool`, redistributing `total_target_rps` across active workers.
 4. Stops when one of the following occurs:
    - `duration_seconds` elapsed
    - measured error rate exceeds `max_error_rate_pct`
