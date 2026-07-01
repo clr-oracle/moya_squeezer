@@ -7,6 +7,7 @@ COPY mix.exs mix.lock ./
 COPY config ./config
 COPY lib ./lib
 COPY scripts ./scripts
+COPY vendor ./vendor
 
 # Build BEAM artifacts in-image from current source so runtime code is never
 # dependent on stale host-side _build outputs.

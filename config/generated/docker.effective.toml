@@ -17,7 +17,7 @@ write_ratio = 0.25
 delete_ratio = 0.05
 
 payload_size = 1024
-duration_seconds = 60
+duration_seconds = 180
 warmup_seconds = 10
 
 # HTTP adapter controls

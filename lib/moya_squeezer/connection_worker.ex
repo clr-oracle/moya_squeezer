@@ -41,6 +41,7 @@ defmodule MoyaSqueezer.ConnectionWorker do
     local_next_id: 1,
     local_keys: MapSet.new(),
     local_key_list: [],
+    task_refs: %{},
     measured_requests: 0,
     measured_started_at_ms: nil
   ]
@@ -148,7 +149,12 @@ defmodule MoyaSqueezer.ConnectionWorker do
   end
 
   @impl true
-  def handle_info({:request_result, request_type, key, started_at_ms, response_code, db_latency_us, dispatched_mode}, state) do
+  def handle_info(
+        {ref, {:request_result, request_type, key, started_at_ms, response_code, db_latency_us, dispatched_mode}},
+        state
+      )
+      when is_reference(ref) do
+    Process.demonitor(ref, [:flush])
     RuntimeState.record_worker_response(response_code)
 
     state_after_pool = maybe_update_local_key_pool(request_type, key, response_code, state)
@@ -164,9 +170,19 @@ defmodule MoyaSqueezer.ConnectionWorker do
     next_state =
       state_after_pool
       |> local_record(metric, db_latency_us, response_code, dispatched_mode)
+      |> drop_task_ref(ref)
       |> Map.update!(:inflight_count, &max(&1 - 1, 0))
 
     {:noreply, next_state}
+  end
+
+  @impl true
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, state) when is_reference(ref) do
+    if Map.has_key?(state.task_refs, ref) do
+      {:noreply, state |> drop_task_ref(ref) |> Map.update!(:inflight_count, &max(&1 - 1, 0))}
+    else
+      {:noreply, state}
+    end
   end
 
   @impl true
@@ -237,24 +253,24 @@ defmodule MoyaSqueezer.ConnectionWorker do
     request_type = choose_request_type(state)
     {key, state_with_key} = choose_key_for_request(request_type, state)
     started_at_ms = System.system_time(:millisecond)
-    parent = self()
     dispatched_mode = state.mode
 
-    case Task.Supervisor.start_child(state.task_supervisor, fn ->
-           {response_code, db_latency_us} =
-             case state.adapter.request(request_type, state.payload_size, state.adapter_opts, key) do
-               {:ok, status, latency_us} -> {status, latency_us}
-               {:error, _reason, latency_us} -> {0, latency_us}
-             end
+    task =
+      Task.Supervisor.async_nolink(state.task_supervisor, fn ->
+        {response_code, db_latency_us} =
+          case state.adapter.request(request_type, state.payload_size, state.adapter_opts, key) do
+            {:ok, status, latency_us} -> {status, latency_us}
+            {:error, _reason, latency_us} -> {0, latency_us}
+          end
 
-           send(parent, {:request_result, request_type, key, started_at_ms, response_code, db_latency_us, dispatched_mode})
-         end) do
-      {:ok, _pid} ->
-        %{state_with_key | inflight_count: state_with_key.inflight_count + 1}
+        {:request_result, request_type, key, started_at_ms, response_code, db_latency_us, dispatched_mode}
+      end)
 
-      {:error, _reason} ->
-        state_with_key
-    end
+    %{
+      state_with_key
+      | inflight_count: state_with_key.inflight_count + 1,
+        task_refs: Map.put(state_with_key.task_refs, task.ref, true)
+    }
   end
 
   defp local_record(state, metric, db_latency_us, response_code, dispatched_mode) do
@@ -379,5 +395,9 @@ defmodule MoyaSqueezer.ConnectionWorker do
     else
       state
     end
+  end
+
+  defp drop_task_ref(state, ref) do
+    %{state | task_refs: Map.delete(state.task_refs, ref)}
   end
 end

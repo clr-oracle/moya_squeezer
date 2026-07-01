@@ -2,8 +2,6 @@ defmodule MoyaSqueezer.MetricsApi do
   @moduledoc false
 
   alias MoyaSqueezer.RuntimeState
-  alias MoyaSqueezer.Runner
-
   @window_ms 1_000
 
   def worker_payload do
@@ -24,16 +22,7 @@ defmodule MoyaSqueezer.MetricsApi do
   end
 
   def manager_payload do
-    segments = RuntimeState.measured_segments()
-
-    to_workers =
-      Enum.map(segments, fn seg ->
-        count =
-          segment_summaries(seg)
-          |> Enum.reduce(0, fn row, acc -> acc + Map.get(row, :measured_requests, 0) end)
-
-        %{worker_id: "#{seg.node}", count: count}
-      end)
+    to_workers = RuntimeState.manager_dispatch_snapshot()
 
     %{
       window_ms: @window_ms,
@@ -46,17 +35,4 @@ defmodule MoyaSqueezer.MetricsApi do
       }
     }
   end
-
-  defp segment_summaries(%{node: target_node, supervisor: supervisor}) when is_pid(supervisor) do
-    if target_node == node() do
-      Runner.worker_segment_summaries(supervisor)
-    else
-      case :rpc.call(target_node, Runner, :worker_segment_summaries, [supervisor]) do
-        list when is_list(list) -> list
-        _ -> []
-      end
-    end
-  end
-
-  defp segment_summaries(_), do: []
 end

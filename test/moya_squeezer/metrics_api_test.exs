@@ -4,6 +4,15 @@ defmodule MoyaSqueezer.MetricsApiTest do
   alias MoyaSqueezer.MetricsApi
   alias MoyaSqueezer.RuntimeState
 
+  setup_all do
+    case Process.whereis(RuntimeState) do
+      nil -> start_supervised!({RuntimeState, []})
+      _pid -> :ok
+    end
+
+    :ok
+  end
+
   setup do
     RuntimeState.reset()
     :ok
@@ -23,35 +32,26 @@ defmodule MoyaSqueezer.MetricsApiTest do
     assert payload.outbound.last_status in [200, 404, 503]
   end
 
-  test "manager payload includes total and per-worker dispatch" do
-    {:ok, sup1} = Task.Supervisor.start_link()
-    {:ok, sup2} = Task.Supervisor.start_link()
-
-    task1 = Task.Supervisor.async_nolink(sup1, fn -> Process.sleep(:infinity) end)
-    task2 = Task.Supervisor.async_nolink(sup2, fn -> Process.sleep(:infinity) end)
-
-    on_exit(fn ->
-      Process.exit(task1.pid, :kill)
-      Process.exit(task2.pid, :kill)
-      Process.exit(sup1, :kill)
-      Process.exit(sup2, :kill)
-    end)
-
+  test "manager payload includes cached total and per-worker dispatch" do
     segments = [
-      %{node: :worker1, supervisor: sup1},
-      %{node: :worker2, supervisor: sup2}
+      %{node: :worker1, supervisor: nil},
+      %{node: :worker2, supervisor: nil}
     ]
 
     RuntimeState.set_measured_segments(segments)
+    RuntimeState.cache_manager_dispatch([
+      %{worker_id: "worker1", count: 11},
+      %{worker_id: "worker2", count: 7}
+    ])
 
     payload = MetricsApi.manager_payload()
 
     assert payload.role == "manager"
     assert payload.window_ms == 1_000
-    assert payload.dispatch.total_dispatched == 0
+    assert payload.dispatch.total_dispatched == 18
     assert Enum.sort_by(payload.dispatch.to_workers, & &1.worker_id) == [
-             %{worker_id: "worker1", count: 0},
-             %{worker_id: "worker2", count: 0}
+             %{worker_id: "worker1", count: 11},
+             %{worker_id: "worker2", count: 7}
            ]
   end
 end

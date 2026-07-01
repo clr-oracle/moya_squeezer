@@ -278,8 +278,9 @@ defmodule MoyaSqueezer.Runner do
     end
   end
 
-  defp run_measured_phase(config, stats_collector, measured_segments, start_rps, supervisor, opts \\ []) do
+  defp run_measured_phase(config, stats_collector, measured_segments, start_rps, supervisor, opts) do
     RuntimeState.set_measured_segments(measured_segments)
+    RuntimeState.cache_manager_dispatch(cached_segment_dispatch_rows(measured_segments))
     signal_setup = install_signal_handlers()
 
     {stop_reason, worker_summaries} =
@@ -295,6 +296,7 @@ defmodule MoyaSqueezer.Runner do
           )
 
         worker_summaries = gather_worker_summaries(measured_segments)
+        RuntimeState.cache_manager_dispatch(cached_segment_dispatch_rows(measured_segments, worker_summaries))
         {stop_reason, worker_summaries}
       after
         RuntimeState.set_measured_segments([])
@@ -391,6 +393,8 @@ defmodule MoyaSqueezer.Runner do
               if snapshot.error_rate_pct > state.config.max_error_rate_pct,
                 do: state.error_breach_streak + 1,
                 else: 0
+
+            RuntimeState.cache_manager_dispatch(cached_segment_dispatch_rows(state.worker_segments))
 
             cond do
               next_error_streak >= state.config.error_breach_consecutive_windows ->
@@ -509,7 +513,7 @@ defmodule MoyaSqueezer.Runner do
     |> Enum.map(fn {_id, pid, _type, _modules} -> pid end)
   end
 
-  defp maybe_run_warmup(config, _segments, _stop_after_warmup \\ true)
+  defp maybe_run_warmup(config, _segments, _stop_after_warmup)
   defp maybe_run_warmup(config, _segments, _stop_after_warmup) when config.warmup_seconds <= 0, do: :no_warmup
 
   defp maybe_run_warmup(config, segments, stop_after_warmup) do
@@ -1085,5 +1089,22 @@ defmodule MoyaSqueezer.Runner do
 
   defp percentile_label(p) when is_float(p) do
     "p#{trunc(p * 100)}"
+  end
+
+  defp cached_segment_dispatch_rows(segments, summaries \\ nil) do
+    summaries_by_node =
+      (summaries || gather_worker_summaries(segments))
+      |> Enum.group_by(&Map.get(&1, :node))
+
+    Enum.map(segments, fn seg ->
+      worker_id = "#{seg.node}"
+
+      count =
+        summaries_by_node
+        |> Map.get(seg.node, [])
+        |> Enum.reduce(0, fn row, acc -> acc + Map.get(row, :measured_requests, 0) end)
+
+      %{worker_id: worker_id, count: count}
+    end)
   end
 end
